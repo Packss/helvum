@@ -40,6 +40,7 @@ mod imp {
     pub struct Application {
         pub(super) window: ui::Window,
         pub(super) graph_manager: OnceCell<GraphManager>,
+        pub(super) pw_sender: OnceCell<Sender<GtkMessage>>,
     }
 
     #[glib::object_subclass]
@@ -103,6 +104,22 @@ mod imp {
             obj.set_accels_for_action("app.quit", &["<Control>Q"]);
             obj.add_action(&quit);
 
+            let unify_stereo_links = gio::SimpleAction::new_stateful(
+                "unify-stereo-links",
+                None,
+                &false.to_variant(),
+            );
+            unify_stereo_links.connect_change_state(clone!(@weak obj => move |action, value| {
+                let enabled = value
+                    .expect("unify-stereo-links action needs a state")
+                    .get::<bool>()
+                    .expect("unify-stereo-links state should be a bool");
+
+                action.set_state(&enabled.to_variant());
+                obj.imp().set_unify_stereo_links(enabled);
+            }));
+            obj.add_action(&unify_stereo_links);
+
             let action_about = gio::ActionEntry::builder("about")
                 .activate(|obj: &super::Application, _, _| {
                     obj.imp().show_about_dialog();
@@ -130,6 +147,14 @@ mod imp {
 
             about_window.present();
         }
+
+        fn set_unify_stereo_links(&self, enabled: bool) {
+            self.pw_sender
+                .get()
+                .expect("pw_sender should be set")
+                .send(GtkMessage::SetUnifyStereoLinks(enabled))
+                .expect("Failed to send stereo link mode message");
+        }
     }
 }
 
@@ -156,10 +181,15 @@ impl Application {
             .set(GraphManager::new(
                 &imp.window.graph(),
                 &imp.window.connection_banner(),
-                pw_sender,
+                pw_sender.clone(),
                 gtk_receiver,
             ))
             .expect("Should be able to set graph manager");
+
+        assert!(
+            imp.pw_sender.set(pw_sender).is_ok(),
+            "Should be able to set pw sender"
+        );
 
         app
     }

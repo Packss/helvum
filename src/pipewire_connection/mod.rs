@@ -67,6 +67,7 @@ pub(super) fn thread_main(
     let mainloop = MainLoop::new().expect("Failed to create mainloop");
     let context = Rc::new(Context::new(&mainloop).expect("Failed to create context"));
     let is_stopped = Rc::new(Cell::new(false));
+    let unify_stereo_links = Rc::new(Cell::new(false));
     let mut is_connecting = false;
 
     while !is_stopped.get() {
@@ -93,13 +94,17 @@ pub(super) fn thread_main(
                 timer.update_timer(interval, None).into_result().unwrap();
 
                 let receiver = pw_receiver.attach(&mainloop, {
-                    clone!(@strong mainloop, @strong is_stopped => move |msg|
-                        if let GtkMessage::Terminate = msg {
+                    clone!(@strong mainloop, @strong is_stopped, @strong unify_stereo_links => move |msg| match msg {
+                        GtkMessage::Terminate => {
                             // main thread requested stop
                             is_stopped.set(true);
                             mainloop.quit();
                         }
-                    )
+                        GtkMessage::SetUnifyStereoLinks(enabled) => {
+                            unify_stereo_links.set(enabled);
+                        }
+                        GtkMessage::ToggleLink { .. } => {}
+                    })
                 });
 
                 mainloop.run();
@@ -123,8 +128,9 @@ pub(super) fn thread_main(
         let state = Rc::new(RefCell::new(State::new()));
 
         let receiver = pw_receiver.attach(&mainloop, {
-            clone!(@strong mainloop, @weak core, @weak registry, @strong state, @strong is_stopped => move |msg| match msg {
-                GtkMessage::ToggleLink { port_from, port_to } => toggle_link(port_from, port_to, &core, &registry, &state),
+            clone!(@strong mainloop, @weak core, @weak registry, @strong state, @strong is_stopped, @strong unify_stereo_links => move |msg| match msg {
+                GtkMessage::ToggleLink { port_from, port_to } => toggle_link(port_from, port_to, unify_stereo_links.get(), &core, &registry, &state),
+                GtkMessage::SetUnifyStereoLinks(enabled) => unify_stereo_links.set(enabled),
                 GtkMessage::Terminate => {
                     // main thread requested stop
                     is_stopped.set(true);
@@ -167,7 +173,7 @@ pub(super) fn thread_main(
                 if let Some(item) = state.borrow_mut().remove(id) {
                     gtk_sender.send(match item {
                         Item::Node { .. } => PipewireMessage::NodeRemoved {id},
-                        Item::Port { node_id } => PipewireMessage::PortRemoved {id, node_id},
+                        Item::Port { node_id, .. } => PipewireMessage::PortRemoved {id, node_id},
                         Item::Link { .. } => PipewireMessage::LinkRemoved {id},
                     }).expect("Failed to send message");
                 } else {
@@ -350,7 +356,14 @@ fn handle_port_info(
             .parse()
             .expect("Could not parse node.id property");
 
-        state.insert(id, Item::Port { node_id });
+        state.insert(
+            id,
+            Item::Port {
+                node_id,
+                name: name.clone(),
+                direction: info.direction(),
+            },
+        );
 
         let params = info.params();
         let enum_format_info = params
@@ -472,36 +485,118 @@ fn handle_link_info(
 fn toggle_link(
     port_from: u32,
     port_to: u32,
+    unify_stereo_links: bool,
     core: &Rc<Core>,
     registry: &Rc<Registry>,
     state: &Rc<RefCell<State>>,
 ) {
-    let state = state.borrow_mut();
-    if let Some(id) = state.get_link_id(port_from, port_to) {
-        info!("Requesting removal of link with id {}", id);
+    if !unify_stereo_links {
+        let existing_link_id = {
+            let state = state.borrow();
+            state.get_link_id(port_from, port_to)
+        };
 
-        // FIXME: Handle error
-        registry.destroy_global(id);
-    } else {
+        if let Some(id) = existing_link_id {
+            info!("Requesting removal of link with id {}", id);
+
+            // FIXME: Handle error
+            registry.destroy_global(id);
+        } else {
+            let (node_from, node_to) = {
+                let state = state.borrow();
+
+                (
+                    state
+                        .get_node_of_port(port_from)
+                        .expect("Requested port not in state"),
+                    state
+                        .get_node_of_port(port_to)
+                        .expect("Requested port not in state"),
+                )
+            };
+
+            info!(
+                "Requesting creation of link from port id:{} to port id:{}",
+                port_from, port_to
+            );
+
+            if let Err(e) = core.create_object::<Link, _>(
+                "link-factory",
+                &properties! {
+                    "link.output.node" => node_from.to_string(),
+                    "link.output.port" => port_from.to_string(),
+                    "link.input.node" => node_to.to_string(),
+                    "link.input.port" => port_to.to_string(),
+                    "object.linger" => "1"
+                },
+            ) {
+                warn!("Failed to create link: {}", e);
+            }
+        }
+
+        return;
+    }
+
+    let (link_pairs, link_ids) = {
+        let state = state.borrow();
+
+        let mut link_pairs = vec![(port_from, port_to)];
+        if let (Some(stereo_from), Some(stereo_to)) = (
+            state.get_stereo_companion_port(port_from),
+            state.get_stereo_companion_port(port_to),
+        ) {
+            if stereo_from != port_from || stereo_to != port_to {
+                link_pairs.push((stereo_from, stereo_to));
+            }
+        }
+
+        let mut link_ids = Vec::new();
+        for (output_port, input_port) in &link_pairs {
+            if let Some(id) = state.get_link_id(*output_port, *input_port) {
+                link_ids.push(id);
+            }
+        }
+
+        (link_pairs, link_ids)
+    };
+
+    if !link_ids.is_empty() {
+        for id in link_ids {
+            info!("Requesting removal of link with id {}", id);
+
+            // FIXME: Handle error
+            registry.destroy_global(id);
+        }
+
+        return;
+    }
+
+    for (output_port, input_port) in link_pairs {
+        let (node_from, node_to) = {
+            let state = state.borrow();
+
+            (
+                state
+                    .get_node_of_port(output_port)
+                    .expect("Requested port not in state"),
+                state
+                    .get_node_of_port(input_port)
+                    .expect("Requested port not in state"),
+            )
+        };
+
         info!(
             "Requesting creation of link from port id:{} to port id:{}",
-            port_from, port_to
+            output_port, input_port
         );
-
-        let node_from = state
-            .get_node_of_port(port_from)
-            .expect("Requested port not in state");
-        let node_to = state
-            .get_node_of_port(port_to)
-            .expect("Requested port not in state");
 
         if let Err(e) = core.create_object::<Link, _>(
             "link-factory",
             &properties! {
                 "link.output.node" => node_from.to_string(),
-                "link.output.port" => port_from.to_string(),
+                "link.output.port" => output_port.to_string(),
                 "link.input.node" => node_to.to_string(),
-                "link.input.port" => port_to.to_string(),
+                "link.input.port" => input_port.to_string(),
                 "object.linger" => "1"
             },
         ) {

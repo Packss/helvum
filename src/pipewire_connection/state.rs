@@ -16,6 +16,37 @@
 
 use std::collections::HashMap;
 
+use pipewire::spa::Direction;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StereoChannel {
+    Left,
+    Right,
+}
+
+impl StereoChannel {
+    fn opposite(self) -> Self {
+        match self {
+            StereoChannel::Left => StereoChannel::Right,
+            StereoChannel::Right => StereoChannel::Left,
+        }
+    }
+}
+
+fn stereo_channel_from_name(name: &str) -> Option<StereoChannel> {
+    let name = name.to_ascii_lowercase();
+
+    for token in name.split(|character: char| !character.is_ascii_alphanumeric()) {
+        match token {
+            "left" | "l" | "fl" => return Some(StereoChannel::Left),
+            "right" | "r" | "fr" => return Some(StereoChannel::Right),
+            _ => {}
+        }
+    }
+
+    None
+}
+
 /// Any pipewire item we need to keep track of.
 /// These will be saved in the `State` struct associated with their id.
 pub(super) enum Item {
@@ -24,6 +55,8 @@ pub(super) enum Item {
         // Save the id of the node this is on so we can remove the port from it
         // when it is deleted.
         node_id: u32,
+        name: String,
+        direction: Direction,
     },
     Link {
         port_from: u32,
@@ -83,10 +116,46 @@ impl State {
 
     /// Convenience function: Get the id of the node a port is on
     pub fn get_node_of_port(&self, port: u32) -> Option<u32> {
-        if let Some(Item::Port { node_id }) = self.get(port) {
+        if let Some(Item::Port { node_id, .. }) = self.get(port) {
             Some(*node_id)
         } else {
             None
         }
+    }
+
+    /// Find the stereo companion port for the specified port, if it has one.
+    pub fn get_stereo_companion_port(&self, port: u32) -> Option<u32> {
+        let Item::Port {
+            node_id,
+            name,
+            direction,
+        } = self.get(port)?
+        else {
+            return None;
+        };
+
+        let stereo_channel = stereo_channel_from_name(name)?;
+        let companion_channel = stereo_channel.opposite();
+
+        self.items.iter().find_map(|(candidate_id, item)| {
+            let Item::Port {
+                node_id: candidate_node_id,
+                name: candidate_name,
+                direction: candidate_direction,
+            } = item
+            else {
+                return None;
+            };
+
+            if *candidate_id == port
+                || *candidate_node_id != *node_id
+                || *candidate_direction != *direction
+            {
+                return None;
+            }
+
+            (stereo_channel_from_name(candidate_name) == Some(companion_channel))
+                .then_some(*candidate_id)
+        })
     }
 }
