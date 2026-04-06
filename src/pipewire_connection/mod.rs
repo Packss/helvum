@@ -16,29 +16,26 @@
 
 mod state;
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-    time::Duration,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use adw::glib::{self, clone};
 use log::{debug, error, info, warn};
 use pipewire::{
+    context::Context,
+    core::{Core, PW_ID_CORE},
     keys,
-    link::{Link, LinkChangeMask, LinkInfo, LinkListener, LinkState},
-    node::{Node, NodeInfo, NodeListener},
-    port::{Port, PortChangeMask, PortInfo, PortListener},
-    prelude::*,
-    properties,
+    link::{Link, LinkChangeMask, LinkInfoRef, LinkListener, LinkState},
+    main_loop::MainLoop,
+    node::{Node, NodeInfoRef, NodeListener},
+    port::{Port, PortChangeMask, PortInfoRef, PortListener},
+    properties::{properties, Properties},
     registry::{GlobalObject, Registry},
     spa::{
         param::{ParamInfoFlags, ParamType},
-        ForeignDict, SpaResult,
+        utils::dict::DictRef,
+        utils::result::SpaResult,
     },
     types::ObjectType,
-    Context, Core, MainLoop,
 };
 
 use crate::{GtkMessage, MediaType, NodeType, PipewireMessage};
@@ -59,37 +56,68 @@ enum ProxyItem {
     },
 }
 
+struct LoopState {
+    is_stopped: bool,
+    props: Properties,
+}
+
+impl LoopState {
+    fn handle_message(&mut self, msg: GtkMessage) -> bool {
+        match msg {
+            GtkMessage::Terminate => self.is_stopped = true,
+            GtkMessage::Connect(remote) => match remote {
+                Some(s) => self.props.insert(*keys::REMOTE_NAME, s),
+                None => self.props.remove(*keys::REMOTE_NAME),
+            },
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// The "main" function of the pipewire thread.
 pub(super) fn thread_main(
-    gtk_sender: glib::Sender<PipewireMessage>,
+    gtk_sender: async_channel::Sender<PipewireMessage>,
     mut pw_receiver: pipewire::channel::Receiver<GtkMessage>,
 ) {
-    let mainloop = MainLoop::new().expect("Failed to create mainloop");
+    let mainloop = MainLoop::new(None).expect("Failed to create mainloop");
     let context = Rc::new(Context::new(&mainloop).expect("Failed to create context"));
     let is_stopped = Rc::new(Cell::new(false));
     let unify_stereo_links = Rc::new(Cell::new(false));
     let mut is_connecting = false;
 
-    while !is_stopped.get() {
+    // Wait PipeWire service to connect from command line arguments.
+    let receiver = pw_receiver.attach(mainloop.loop_(), {
+        clone!(@strong mainloop, @strong loop_state => move |msg|
+            if loop_state.borrow_mut().handle_message(msg) {
+                mainloop.quit();
+            }
+        )
+    });
+    mainloop.run();
+    pw_receiver = receiver.deattach();
+
+    while !loop_state.borrow().is_stopped {
         // Try to connect
-        let core = match context.connect(Some(properties! {
-            "media.category" => "Manager"
-        })) {
+        let props = loop_state.borrow().props.clone();
+        let core = match context.connect(Some(props)) {
             Ok(core) => Rc::new(core),
             Err(_) => {
                 if !is_connecting {
                     is_connecting = true;
                     gtk_sender
-                        .send(PipewireMessage::Connecting)
+                        .send_blocking(PipewireMessage::Connecting)
                         .expect("Failed to send message");
                 }
 
                 // If connection is failed, try to connect again in 200ms
                 let interval = Some(Duration::from_millis(200));
 
-                let timer = mainloop.add_timer(clone!(@strong mainloop => move |_| {
-                    mainloop.quit();
-                }));
+                let timer = mainloop
+                    .loop_()
+                    .add_timer(clone!(@strong mainloop => move |_| {
+                        mainloop.quit();
+                    }));
 
                 timer.update_timer(interval, None).into_result().unwrap();
 
@@ -117,7 +145,7 @@ pub(super) fn thread_main(
         if is_connecting {
             is_connecting = false;
             gtk_sender
-                .send(PipewireMessage::Connected)
+                .send_blocking(PipewireMessage::Connected)
                 .expect("Failed to send message");
         }
 
@@ -139,22 +167,24 @@ pub(super) fn thread_main(
             })
         });
 
-        let gtk_sender = gtk_sender.clone();
-        let _listener = core.add_listener_local()
-            .error(clone!(@strong mainloop, @strong gtk_sender, @strong is_stopped => move |id, _seq, res, message| {
-                if id != pipewire::PW_ID_CORE {
-                    return;
-                }
+        let _listener = core
+            .add_listener_local()
+            .error(
+                clone!(@strong mainloop, @strong gtk_sender => move |id, _seq, res, message| {
+                    if id != PW_ID_CORE {
+                        return;
+                    }
 
-                if res == -libc::EPIPE {
-                    gtk_sender.send(PipewireMessage::Disconnected)
-                        .expect("Failed to send message");
-                    mainloop.quit();
-                } else {
-                    let serr = SpaResult::from_c(res).into_result().unwrap_err();
-                    error!("Pipewire Core received error {serr}: {message}");
-                }
-            }))
+                    if res == -libc::EPIPE {
+                        gtk_sender.send_blocking(PipewireMessage::Disconnected)
+                            .expect("Failed to send message");
+                        mainloop.quit();
+                    } else {
+                        let serr = SpaResult::from_c(res).into_result().unwrap_err();
+                        error!("Pipewire Core received error {serr}: {message}");
+                    }
+                }),
+            )
             .register();
 
         let _listener = registry
@@ -169,9 +199,9 @@ pub(super) fn thread_main(
                     }
                 }
             ))
-            .global_remove(clone!(@strong proxies, @strong state => move |id| {
+            .global_remove(clone!(@strong gtk_sender, @strong proxies, @strong state => move |id| {
                 if let Some(item) = state.borrow_mut().remove(id) {
-                    gtk_sender.send(match item {
+                    gtk_sender.send_blocking(match item {
                         Item::Node { .. } => PipewireMessage::NodeRemoved {id},
                         Item::Port { node_id, .. } => PipewireMessage::PortRemoved {id, node_id},
                         Item::Link { .. } => PipewireMessage::LinkRemoved {id},
@@ -189,11 +219,15 @@ pub(super) fn thread_main(
 
         mainloop.run();
         pw_receiver = receiver.deattach();
+
+        gtk_sender
+            .send_blocking(PipewireMessage::Disconnected)
+            .expect("Failed to send message");
     }
 }
 
 /// Get the nicest possible name for the node, using a fallback chain of possible name attributes
-fn get_node_name(props: &ForeignDict) -> &str {
+fn get_node_name(props: &DictRef) -> &str {
     props
         .get(&keys::NODE_DESCRIPTION)
         .or_else(|| props.get(&keys::NODE_NICK))
@@ -203,8 +237,8 @@ fn get_node_name(props: &ForeignDict) -> &str {
 
 /// Handle a new node being added
 fn handle_node(
-    node: &GlobalObject<ForeignDict>,
-    sender: &glib::Sender<PipewireMessage>,
+    node: &GlobalObject<&DictRef>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &Rc<Registry>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -239,7 +273,7 @@ fn handle_node(
     state.borrow_mut().insert(node.id, Item::Node);
 
     sender
-        .send(PipewireMessage::NodeAdded {
+        .send_blocking(PipewireMessage::NodeAdded {
             id: node.id,
             name,
             node_type,
@@ -264,8 +298,8 @@ fn handle_node(
 }
 
 fn handle_node_info(
-    info: &NodeInfo,
-    sender: &glib::Sender<PipewireMessage>,
+    info: &NodeInfoRef,
+    sender: &async_channel::Sender<PipewireMessage>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
 ) {
     debug!("Received node info: {:?}", info);
@@ -282,7 +316,7 @@ fn handle_node_info(
         let name = get_node_name(props).to_string();
 
         sender
-            .send(PipewireMessage::NodeNameChanged {
+            .send_blocking(PipewireMessage::NodeNameChanged {
                 id,
                 name,
                 media_name: media_name.to_string(),
@@ -293,8 +327,8 @@ fn handle_node_info(
 
 /// Handle a new port being added
 fn handle_port(
-    port: &GlobalObject<ForeignDict>,
-    sender: &glib::Sender<PipewireMessage>,
+    port: &GlobalObject<&DictRef>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &Rc<Registry>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -325,10 +359,10 @@ fn handle_port(
 }
 
 fn handle_port_info(
-    info: &PortInfo,
+    info: &PortInfoRef,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     debug!("Received port info: {:?}", info);
 
@@ -376,7 +410,7 @@ fn handle_port_info(
         }
 
         sender
-            .send(PipewireMessage::PortAdded {
+            .send_blocking(PipewireMessage::PortAdded {
                 id,
                 node_id,
                 name,
@@ -389,7 +423,7 @@ fn handle_port_info(
 fn handle_port_enum_format(
     port_id: u32,
     param: Option<&pipewire::spa::pod::Pod>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     let media_type = param
         .and_then(|param| pipewire::spa::param::format_utils::parse_format(param).ok())
@@ -397,7 +431,7 @@ fn handle_port_enum_format(
         .unwrap_or(MediaType::Unknown);
 
     sender
-        .send(PipewireMessage::PortFormatChanged {
+        .send_blocking(PipewireMessage::PortFormatChanged {
             id: port_id,
             media_type,
         })
@@ -406,8 +440,8 @@ fn handle_port_enum_format(
 
 /// Handle a new link being added
 fn handle_link(
-    link: &GlobalObject<ForeignDict>,
-    sender: &glib::Sender<PipewireMessage>,
+    link: &GlobalObject<&DictRef>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &Rc<Registry>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -435,9 +469,9 @@ fn handle_link(
 }
 
 fn handle_link_info(
-    info: &LinkInfo,
+    info: &LinkInfoRef,
     state: &Rc<RefCell<State>>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     debug!("Received link info: {:?}", info);
 
@@ -448,7 +482,7 @@ fn handle_link_info(
         // Info was an update - figure out if we should notify the gtk thread
         if info.change_mask().contains(LinkChangeMask::STATE) {
             sender
-                .send(PipewireMessage::LinkStateChanged {
+                .send_blocking(PipewireMessage::LinkStateChanged {
                     id,
                     active: matches!(info.state(), LinkState::Active),
                 })
@@ -456,7 +490,7 @@ fn handle_link_info(
         }
         if info.change_mask().contains(LinkChangeMask::FORMAT) {
             sender
-                .send(PipewireMessage::LinkFormatChanged {
+                .send_blocking(PipewireMessage::LinkFormatChanged {
                     id,
                     media_type: get_link_media_type(info),
                 })
@@ -470,7 +504,7 @@ fn handle_link_info(
         state.insert(id, Item::Link { port_from, port_to });
 
         sender
-            .send(PipewireMessage::LinkAdded {
+            .send_blocking(PipewireMessage::LinkAdded {
                 id,
                 port_from,
                 port_to,
@@ -605,7 +639,7 @@ fn toggle_link(
     }
 }
 
-fn get_link_media_type(link_info: &LinkInfo) -> MediaType {
+fn get_link_media_type(link_info: &LinkInfoRef) -> MediaType {
     let media_type = link_info
         .format()
         .and_then(|format| pipewire::spa::param::format_utils::parse_format(format).ok())

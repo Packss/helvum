@@ -16,11 +16,12 @@
 
 use adw::{
     gio,
-    glib::{self, clone, Receiver},
+    glib::{self, clone},
     gtk,
     prelude::*,
     subclass::prelude::*,
 };
+use log::error;
 use pipewire::channel::Sender;
 
 use crate::{graph_manager::GraphManager, ui, GtkMessage, PipewireMessage};
@@ -30,11 +31,14 @@ static APP_ID: &str = "org.pipewire.Helvum";
 static VERSION: &str = env!("CARGO_PKG_VERSION");
 static AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 
+const DEFAULT_REMOTE_NAME: &str = "Default Remote";
+
 mod imp {
     use super::*;
 
+    use std::cell::OnceCell;
+
     use adw::subclass::prelude::AdwApplicationImpl;
-    use once_cell::unsync::OnceCell;
 
     #[derive(Default)]
     pub struct Application {
@@ -126,6 +130,29 @@ mod imp {
                 })
                 .build();
             obj.add_action_entries([action_about]);
+
+            let unify_stereo = gio::SimpleAction::new_stateful(
+                "unify-stereo-connections",
+                None,
+                &true.to_variant(),
+            );
+            if let Some(graph_manager) = self.graph_manager.get() {
+                graph_manager.set_unify_stereo_connections(true);
+            }
+            unify_stereo.connect_change_state(clone!(@weak self as imp => move |action, value| {
+                let Some(value) = value else {
+                    return;
+                };
+                let Some(enabled) = value.get::<bool>() else {
+                    return;
+                };
+
+                action.set_state(value);
+                if let Some(graph_manager) = imp.graph_manager.get() {
+                    graph_manager.set_unify_stereo_connections(enabled);
+                }
+            }));
+            obj.add_action(&unify_stereo);
         }
 
         fn show_about_dialog(&self) {
@@ -168,7 +195,7 @@ impl Application {
     /// Create the view.
     /// This will set up the entire user interface and prepare it for being run.
     pub(super) fn new(
-        gtk_receiver: Receiver<PipewireMessage>,
+        gtk_receiver: async_channel::Receiver<PipewireMessage>,
         pw_sender: Sender<GtkMessage>,
     ) -> Self {
         let app: Application = glib::Object::builder()
@@ -176,6 +203,8 @@ impl Application {
             .build();
 
         let imp = app.imp();
+
+        imp.setup_options(pw_sender.clone());
 
         imp.graph_manager
             .set(GraphManager::new(
