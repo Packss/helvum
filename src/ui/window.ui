@@ -5,11 +5,9 @@
   <menu id="primary_menu">
     <section>
       <item>
-        <attribute name="label" translatable="yes">Unify stereo connections</attribute>
-        <attribute name="action">app.unify-stereo-connections</attribute>
+        <attribute name="label">_Unify Stereo Connections</attribute>
+        <attribute name="action">app.unify-stereo-links</attribute>
       </item>
-    </section>
-    <section>
       <item>
         <attribute name="label">_About Helvum</attribute>
         <attribute name="action">app.about</attribute>

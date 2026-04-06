@@ -27,8 +27,8 @@ use pipewire::spa::{param::format::MediaType, utils::Direction};
 pub enum GtkMessage {
     /// Toggle a link between the two specified ports.
     ToggleLink { port_from: u32, port_to: u32 },
-    /// Connect to PipeWire service.
-    Connect(Option<String>),
+    /// Enable or disable stereo link unification.
+    SetUnifyStereoLinks(bool),
     /// Quit the event loop and let the thread finish.
     Terminate,
 }
