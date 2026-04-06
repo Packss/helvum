@@ -113,6 +113,29 @@ mod imp {
                 })
                 .build();
             obj.add_action_entries([action_about]);
+
+            let unify_stereo = gio::SimpleAction::new_stateful(
+                "unify-stereo-connections",
+                None,
+                &true.to_variant(),
+            );
+            if let Some(graph_manager) = self.graph_manager.get() {
+                graph_manager.set_unify_stereo_connections(true);
+            }
+            unify_stereo.connect_change_state(clone!(@weak self as imp => move |action, value| {
+                let Some(value) = value else {
+                    return;
+                };
+                let Some(enabled) = value.get::<bool>() else {
+                    return;
+                };
+
+                action.set_state(value);
+                if let Some(graph_manager) = imp.graph_manager.get() {
+                    graph_manager.set_unify_stereo_connections(enabled);
+                }
+            }));
+            obj.add_action(&unify_stereo);
         }
 
         fn show_about_dialog(&self) {

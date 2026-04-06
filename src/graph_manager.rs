@@ -23,7 +23,10 @@ use crate::{ui::graph::GraphView, GtkMessage, PipewireMessage};
 mod imp {
     use super::*;
 
-    use std::{cell::OnceCell, cell::RefCell, collections::HashMap};
+    use std::{
+        cell::{Cell, OnceCell, RefCell},
+        collections::HashMap,
+    };
 
     use crate::{ui::graph, MediaType, NodeType};
 
@@ -38,6 +41,15 @@ mod imp {
 
         pub pw_sender: OnceCell<PwSender<crate::GtkMessage>>,
         pub items: RefCell<HashMap<u32, glib::Object>>,
+        pub ports: RefCell<HashMap<u32, PortDetails>>,
+        pub unify_stereo_connections: Cell<bool>,
+    }
+
+    #[derive(Clone)]
+    pub struct PortDetails {
+        pub node_id: u32,
+        pub name: String,
+        pub direction: pipewire::spa::utils::Direction,
     }
 
     #[glib::object_subclass]
@@ -188,6 +200,14 @@ mod imp {
             );
 
             items.insert(id, port.clone().upcast());
+            self.ports.borrow_mut().insert(
+                id,
+                PortDetails {
+                    node_id,
+                    name: name.to_owned(),
+                    direction,
+                },
+            );
 
             node.add_port(port);
         }
@@ -226,6 +246,7 @@ mod imp {
                 log::warn!("Unknown Port (id: {id}) removed from graph");
                 return;
             };
+            self.ports.borrow_mut().remove(&id);
             let Ok(port) = port.dynamic_cast::<graph::Port>() else {
                 log::warn!("Graph Manager item under port id {id} is not a port");
                 return;
@@ -319,10 +340,57 @@ mod imp {
 
         // Toggle a link between the two specified ports on the remote pipewire server.
         fn toggle_link(&self, port_from: u32, port_to: u32) {
+            self.send_toggle_link(port_from, port_to);
+
+            if !self.unify_stereo_connections.get() {
+                return;
+            }
+
+            let Some((paired_from, paired_to)) = self.find_stereo_pair(port_from, port_to) else {
+                return;
+            };
+
+            self.send_toggle_link(paired_from, paired_to);
+        }
+
+        fn send_toggle_link(&self, port_from: u32, port_to: u32) {
             let sender = self.pw_sender.get().expect("pw_sender shoud be set");
             sender
                 .send(crate::GtkMessage::ToggleLink { port_from, port_to })
                 .expect("Failed to send message");
+        }
+
+        fn find_stereo_pair(&self, port_from: u32, port_to: u32) -> Option<(u32, u32)> {
+            let ports = self.ports.borrow();
+
+            let source = ports.get(&port_from)?;
+            let target = ports.get(&port_to)?;
+
+            let source_pair_name = swap_stereo_channel_name(&source.name)?;
+            let target_pair_name = swap_stereo_channel_name(&target.name)?;
+
+            let source_pair_id = ports
+                .iter()
+                .find_map(|(id, details)| {
+                    (details.node_id == source.node_id
+                        && details.direction == source.direction
+                        && details.name == source_pair_name)
+                        .then_some(*id)
+                })?;
+            let target_pair_id = ports
+                .iter()
+                .find_map(|(id, details)| {
+                    (details.node_id == target.node_id
+                        && details.direction == target.direction
+                        && details.name == target_pair_name)
+                        .then_some(*id)
+                })?;
+
+            if source_pair_id == port_from || target_pair_id == port_to {
+                return None;
+            }
+
+            Some((source_pair_id, target_pair_id))
         }
 
         /// Remove the link with the specified id from the view.
@@ -343,9 +411,45 @@ mod imp {
 
         fn clear(&self) {
             self.items.borrow_mut().clear();
+            self.ports.borrow_mut().clear();
             self.obj().graph().clear();
         }
     }
+}
+
+fn swap_stereo_channel_name(name: &str) -> Option<String> {
+    for (left, right) in [
+        ("_FL", "_FR"),
+        (".FL", ".FR"),
+        (" FL", " FR"),
+        ("front-left", "front-right"),
+        ("Front-Left", "Front-Right"),
+        ("left", "right"),
+        ("Left", "Right"),
+        ("_L", "_R"),
+        (".L", ".R"),
+        (" L", " R"),
+    ] {
+        if let Some(swapped) = replace_once(name, left, right) {
+            return Some(swapped);
+        }
+        if let Some(swapped) = replace_once(name, right, left) {
+            return Some(swapped);
+        }
+    }
+
+    None
+}
+
+fn replace_once(name: &str, from: &str, to: &str) -> Option<String> {
+    let index = name.find(from)?;
+
+    let mut swapped = String::with_capacity(name.len() - from.len() + to.len());
+    swapped.push_str(&name[..index]);
+    swapped.push_str(to);
+    swapped.push_str(&name[index + from.len()..]);
+
+    Some(swapped)
 }
 
 glib::wrapper! {
@@ -375,5 +479,9 @@ impl GraphManager {
         );
 
         res
+    }
+
+    pub fn set_unify_stereo_connections(&self, enabled: bool) {
+        self.imp().unify_stereo_connections.set(enabled);
     }
 }
